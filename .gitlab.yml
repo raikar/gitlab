@@ -1,0 +1,244 @@
+container_scanning:
+  image: docker:stable
+  variables:
+    DOCKER_DRIVER: overlay2
+    ## Define two new variables based on GitLab's CI/CD predefined variables
+    ## https://docs.gitlab.com/ee/ci/variables/#predefined-environment-variables
+    CI_APPLICATION_REPOSITORY: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG
+    CI_APPLICATION_TAG: $CI_COMMIT_SHA
+  allow_failure: true
+  services:
+    - docker:stable-dind
+  script:
+    - docker run -d --name db arminc/clair-db:latest
+    - docker run -p 6060:6060 --link db:postgres -d --name clair --restart on-failure arminc/clair-local-scan:v2.0.6
+    - apk add -U wget ca-certificates
+    - docker pull ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+    - wget https://github.com/arminc/clair-scanner/releases/download/v8/clair-scanner_linux_amd64
+    - mv clair-scanner_linux_amd64 clair-scanner
+    - chmod +x clair-scanner
+    - touch clair-whitelist.yml
+    - while( ! wget -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; done
+    - retries=0
+    - echo "Waiting for clair daemon to start"
+    - while( ! wget -T 10 -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; echo -n "." ; if [ $retries -eq 10 ] ; then echo " Timeout, aborting." ; exit 1 ; fi ; retries=$(($retries+1)) ; done
+    - ./clair-scanner -c http://docker:6060 --ip $(hostname -i) -r gl-container-scanning-report.json -l clair.log -w clair-whitelist.yml ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG} || true
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+
+#######################################################################################################################################33
+
+dast:
+  image: registry.gitlab.com/gitlab-org/security-products/zaproxy
+  variables:
+    website: "https://example.com"
+  allow_failure: true
+  script:
+    - mkdir /zap/wrk/
+    - /zap/zap-baseline.py -J gl-dast-report.json -t $website || true
+    - cp /zap/wrk/gl-dast-report.json .
+  artifacts:
+    reports:
+      dast: gl-dast-report.json
+
+#######################################################################################################################################33
+
+dependency_scanning:
+  image: docker:stable
+  variables:
+    DOCKER_DRIVER: overlay2
+  allow_failure: true
+  services:
+    - docker:stable-dind
+  script:
+    - export DS_VERSION=${SP_VERSION:-$(echo "$CI_SERVER_VERSION" | sed 's/^\([0-9]*\)\.\([0-9]*\).*/\1-\2-stable/')}
+    - |
+      docker run \
+      --env DS_ANALYZER_IMAGES \
+      --env DS_ANALYZER_IMAGE_PREFIX \
+      --env DS_ANALYZER_IMAGE_TAG \
+      --env DS_DEFAULT_ANALYZERS \
+      --env DEP_SCAN_DISABLE_REMOTE_CHECKS \
+      --env DS_DOCKER_CLIENT_NEGOTIATION_TIMEOUT \
+      --env DS_PULL_ANALYZER_IMAGE_TIMEOUT \
+      --env DS_RUN_ANALYZER_TIMEOUT \
+      --volume "$PWD:/code" \
+      --volume /var/run/docker.sock:/var/run/docker.sock \
+      "registry.gitlab.com/gitlab-org/security-products/dependency-scanning:$DS_VERSION" /code
+  dependencies: []
+  artifacts:
+    reports:
+      dependency_scanning: gl-dependency-scanning-report.json
+
+#######################################################################################################################################33
+
+dependency:
+    stage: report
+    image:
+        name: owasp/dependency-check
+        entrypoint: [""]
+    before_script:
+        - mkdir data
+        - mkdir dependency-check
+        - ...
+    script:
+        - /usr/share/dependency-check/bin/dependency-check.sh
+            --project ...
+            -format=ALL
+            --proxyserver="${PROXY_HOST}"
+            --proxyport="${PROXY_PORT}"
+            --suppression=$CI_PROJECT_DIR/dependency_check_suppressions.xml
+            --scan=$CI_PROJECT_DIR/dependency-check
+            --out=$CI_PROJECT_DIR/dependency-check
+            --data=$CI_PROJECT_DIR/data
+    artifacts:
+        paths:
+            - "dependency-check/dependency-check-*"
+
+#######################################################################################################################################33
+
+owasp_dep_check:
+  stage: security
+  image: 
+    name: owasp/dependency-check:3.3.1
+    entrypoint: [""]
+  allow_failure: false
+  entrypoint: 
+  script:
+    - /usr/share/dependency-check/bin/dependency-check.sh 
+      --project "Testing" 
+      --scan "." 
+      --data /foo
+
+#######################################################################################################################################33
+
+license_management:
+  image:
+    name: "registry.gitlab.com/gitlab-org/security-products/license-management:$CI_SERVER_VERSION_MAJOR-$CI_SERVER_VERSION_MINOR-stable"
+    entrypoint: [""]
+  stage: test
+  allow_failure: true
+  script:
+    - /run.sh analyze .
+  artifacts:
+    reports:
+      license_management: gl-license-management-report.json
+
+
+#######################################################################################################################################33
+
+
+dependency:
+    stage: report
+    image:
+        name: owasp/dependency-check:3.3.1
+        entrypoint: [""]
+    before_script:
+    script:
+        - /usr/share/dependency-check/bin/dependency-check.sh
+            --project IterHotel
+            -format=ALL
+            --proxyserver="${PROXY_HOST}"
+            --proxyport="${PROXY_PORT}"
+            --suppression=$CI_PROJECT_DIR/dependency_check_suppressions.xml
+            --scan=$CI_PROJECT_DIR/dependency-check
+    artifacts:
+        paths:
+            - dependency-check-report.html
+
+
+
+#######################################################################################################################################33
+
+
+  stage: code-check
+  script: 
+    - export OWASPDC_DIRECTORY=$PWD/OWASP-Dependency-Check
+    - export DATA_DIRECTORY=$OWASPDC_DIRECTORY/data
+    - export REPORT_DIRECTORY=$OWASPDC_DIRECTORY/reports
+    - '[[ ! -d "$DATA_DIRECTORY" ]] || echo "Initially creating persistent directories" && mkdir -p "$DATA_DIRECTORY" && sudo chmod -R 777 "$DATA_DIRECTORY" && mkdir -p "$REPORT_DIRECTORY" && sudo chmod -R 777 "$REPORT_DIRECTORY"'
+    - docker run --rm
+     --volume $(pwd):/src
+     --volume "$DATA_DIRECTORY":/usr/share/dependency-check/data
+     --volume "$REPORT_DIRECTORY":/report 
+     "owasp/dependency-check"
+     --scan /src
+     --format "ALL"
+     --project "My OWASP Dependency Check Project"
+     --out /report
+    - cp OWASP-Dependency-Check/reports/dependency-check-report.json $PWD/dependency-check-report.json
+    - sudo chown -R gitlab-runner.gitlab-runner ${PWD}
+    - date
+  artifacts:
+    paths: 
+      - dependency-check-report.json
+      - OWASP-Dependency-Check/reports/
+
+#######################################################################################################################################33
+
+
+4/8 dependency-scanning:
+  <<: *job_docker_group
+  script:
+    - export SP_VERSION=$(echo "$CI_SERVER_VERSION" | sed 's/^\([0-9]*\)\.\([0-9]*\).*/\1-\2-stable/')
+    - docker run --rm
+        --env DEP_SCAN_DISABLE_REMOTE_CHECKS="${DEP_SCAN_DISABLE_REMOTE_CHECKS:-false}"
+        --volume "$PWD:/code"
+        --volume /etc/localtime:/etc/localtime:ro
+        --volume /var/run/docker.sock:/var/run/docker.sock
+        "registry.gitlab.com/gitlab-org/security-products/dependency-scanning:$SP_VERSION" /code
+    - date
+  artifacts:
+    paths: [gl-dependency-scanning-report.json]    
+#  except:
+#    variables:
+#      - $CONTAINER_SCANNING_DISABLE
+
+
+
+#######################################################################################################################################33
+
+
+stages:
+ - build
+ - test
+ - release
+ - artefact_scanning 
+ - preprod
+ - integration
+ - prod
+
+lint:
+  stage: build
+  script:
+   - docker pull hadolint/hadolint
+   # - docker run --rm -i hadolint/hadolint < Dockerfile
+   - docker run --rm -i -v $(pwd):/opt hadolint/hadolint /bin/hadolint
+  allow_failure: true
+
+git-secrets:
+   stage: build
+   script:
+    - docker pull secfigo/trufflehog
+    - docker run --user $(id -u):$(id -g) -v $(pwd):/src --rm secfigo/trufflehog trufflehog --fail_code yes file:///src
+   allow_failure: true
+
+sast:
+  stage: build
+  script:
+   - id -u
+   - id -g
+   - docker pull secfigo/bandit
+   - docker run --user $(id -u):$(id -g) -v $(pwd):/src --rm secfigo/bandit bandit -r /src
+  allow_failure: true
+
+# you need to setup a server at port 10.0.1.22:8000 for this to work, a simple web server can be run using python -m SimpleHTTPServer
+zap-baseline:
+  stage: integration
+  script:
+   - docker run -t owasp/zap2docker-stable zap-baseline.py -t http://10.0.1.22:8000/
+   # - docker run -t owasp/zap2docker-stable zap-baseline.py -j -t https://10.0.1.22/ # with ajax scanning
+  allow_failure: true
+
+
